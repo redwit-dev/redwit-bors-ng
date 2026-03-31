@@ -346,10 +346,13 @@ defmodule BorsNG.GitHub.Server do
   end
 
   def do_handle_call(:force_push, repo_conn, {sha, to}) do
+    Logger.info("force_push: sha=#{sha}, branch=#{to}")
+
     repo_conn
     |> get!("branches/#{to}")
     |> case do
       %{status: 404} ->
+        Logger.info("Branch #{to} not found, creating new ref")
         msg = %{ref: "refs/heads/#{to}", sha: sha}
 
         repo_conn
@@ -359,27 +362,37 @@ defmodule BorsNG.GitHub.Server do
             {:ok, sha}
 
           %{status: status, body: body} ->
+            Logger.error("Failed to create ref: status=#{status}, body=#{inspect(body)}")
             {:error, :force_push, status, body}
         end
 
       %{body: raw, status: 200} ->
-        if sha != Jason.decode!(raw)["commit"]["sha"] do
+        current_sha = Jason.decode!(raw)["commit"]["sha"]
+        Logger.info("Branch #{to} exists, current_sha=#{current_sha}, new_sha=#{sha}")
+
+        if sha != current_sha do
           msg = %{force: true, sha: sha}
+          patch_path = "git/refs/heads/#{to}"
+          Logger.info("Updating ref with PATCH to: #{patch_path}")
 
           repo_conn
-          |> patch!("git/refs/heads/#{to}", Jason.encode!(msg))
+          |> patch!(patch_path, Jason.encode!(msg))
           |> case do
             %{status: 200} ->
+              Logger.info("Successfully updated ref")
               {:ok, sha}
 
             %{status: status, body: body} ->
+              Logger.error("Failed to update ref: status=#{status}, body=#{inspect(body)}, path=#{patch_path}")
               {:error, :force_push, status, body}
           end
         else
+          Logger.info("SHA already matches, no update needed")
           {:ok, sha}
         end
 
       %{body: body, status: status, headers: headers} ->
+        Logger.error("Unexpected response from get branches: status=#{status}, body=#{inspect(body)}")
         {:error, :force_push, status, body, Map.new(headers)["x-github-request-id"]}
     end
   end
@@ -821,9 +834,15 @@ defmodule BorsNG.GitHub.Server do
          body,
          content_type \\ @content_type
        ) do
-    "token #{token}"
+    url = "/repositories/#{repo_xref}/#{path}"
+    Logger.debug("PATCH request: #{url}, body: #{body}")
+
+    result = "token #{token}"
     |> tesla_client(content_type)
-    |> Tesla.patch!("/repositories/#{repo_xref}/#{path}", body)
+    |> Tesla.patch!(url, body)
+
+    Logger.debug("PATCH response: status=#{result.status}, body=#{inspect(result.body)}")
+    result
   end
 
   @spec get!(tconn, binary, binary, list) :: map
