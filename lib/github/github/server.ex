@@ -348,6 +348,15 @@ defmodule BorsNG.GitHub.Server do
   def do_handle_call(:force_push, repo_conn, {sha, to}) do
     Logger.info("force_push: sha=#{sha}, branch=#{to}")
 
+    # Get repository information to obtain owner/repo name
+    {{:raw, token}, repo_xref} = repo_conn
+    repo_full_name = case get_repo_full_name(token, repo_xref) do
+      {:ok, name} -> name
+      {:error, _} -> nil
+    end
+
+    Logger.info("Repository: #{inspect(repo_full_name)}")
+
     repo_conn
     |> get!("branches/#{to}")
     |> case do
@@ -355,64 +364,111 @@ defmodule BorsNG.GitHub.Server do
         Logger.info("Branch #{to} not found, creating new ref")
         msg = %{ref: "refs/heads/#{to}", sha: sha}
 
-        repo_conn
-        |> post!("git/refs", Jason.encode!(msg))
-        |> case do
-          %{status: 201} ->
-            {:ok, sha}
+        result = if repo_full_name do
+          post_path = "/repos/#{repo_full_name}/git/refs"
+          Logger.info("Creating ref with POST to: #{post_path}")
 
-          %{status: status, body: body} ->
-            Logger.error("Failed to create ref: status=#{status}, body=#{inspect(body)}")
-            {:error, :force_push, status, body}
+          "token #{token}"
+          |> tesla_client()
+          |> Tesla.post!(post_path, Jason.encode!(msg))
+          |> case do
+            %{status: 201} ->
+              {:ok, sha}
+
+            %{status: status, body: body} ->
+              Logger.error("Failed to create ref: status=#{status}, body=#{inspect(body)}")
+              {:error, :force_push, status, body}
+          end
+        else
+          # Fallback
+          repo_conn
+          |> post!("git/refs", Jason.encode!(msg))
+          |> case do
+            %{status: 201} ->
+              {:ok, sha}
+
+            %{status: status, body: body} ->
+              Logger.error("Failed to create ref: status=#{status}, body=#{inspect(body)}")
+              {:error, :force_push, status, body}
+          end
         end
+
+        result
 
       %{body: raw, status: 200} ->
         current_sha = Jason.decode!(raw)["commit"]["sha"]
         Logger.info("Branch #{to} exists, current_sha=#{current_sha}, new_sha=#{sha}")
 
         if sha != current_sha do
-          # Try PATCH first
-          msg = %{force: true, sha: sha}
-          patch_path = "git/refs/heads/#{to}"
-          Logger.info("Updating ref with PATCH to: #{patch_path}")
+          # Use owner/repo format for git refs operations
+          result = if repo_full_name do
+            msg = %{force: true, sha: sha}
+            patch_path = "/repos/#{repo_full_name}/git/refs/heads/#{to}"
+            Logger.info("Updating ref with PATCH to: #{patch_path}")
 
-          repo_conn
-          |> patch!(patch_path, Jason.encode!(msg))
-          |> case do
-            %{status: 200} ->
-              Logger.info("Successfully updated ref")
-              {:ok, sha}
+            "token #{token}"
+            |> tesla_client()
+            |> Tesla.patch!(patch_path, Jason.encode!(msg))
+            |> case do
+              %{status: 200} ->
+                Logger.info("Successfully updated ref")
+                {:ok, sha}
 
-            %{status: 422, body: body} ->
-              Logger.warn("PATCH failed with 422, trying DELETE+POST instead. Error: #{inspect(body)}")
+              %{status: 422, body: body} ->
+                Logger.warn("PATCH failed with 422, trying DELETE+POST instead. Error: #{inspect(body)}")
 
-              # Delete the ref
-              case delete!(repo_conn, "git/refs/heads/#{to}") do
-                %{status: 204} ->
-                  Logger.info("Successfully deleted ref")
-                  # Recreate it
-                  msg = %{ref: "refs/heads/#{to}", sha: sha}
-                  repo_conn
-                  |> post!("git/refs", Jason.encode!(msg))
-                  |> case do
-                    %{status: 201} ->
-                      Logger.info("Successfully recreated ref")
-                      {:ok, sha}
+                # Delete the ref
+                delete_path = "/repos/#{repo_full_name}/git/refs/heads/#{to}"
+                "token #{token}"
+                |> tesla_client()
+                |> Tesla.delete!(delete_path)
+                |> case do
+                  %{status: 204} ->
+                    Logger.info("Successfully deleted ref")
+                    # Recreate it
+                    msg = %{ref: "refs/heads/#{to}", sha: sha}
+                    post_path = "/repos/#{repo_full_name}/git/refs"
 
-                    %{status: status, body: body} ->
-                      Logger.error("Failed to recreate ref: status=#{status}, body=#{inspect(body)}")
-                      {:error, :force_push, status, body}
-                  end
+                    "token #{token}"
+                    |> tesla_client()
+                    |> Tesla.post!(post_path, Jason.encode!(msg))
+                    |> case do
+                      %{status: 201} ->
+                        Logger.info("Successfully recreated ref")
+                        {:ok, sha}
 
-                %{status: status, body: body} ->
-                  Logger.error("Failed to delete ref: status=#{status}, body=#{inspect(body)}")
-                  {:error, :force_push, status, body}
-              end
+                      %{status: status, body: body} ->
+                        Logger.error("Failed to recreate ref: status=#{status}, body=#{inspect(body)}")
+                        {:error, :force_push, status, body}
+                    end
 
-            %{status: status, body: body} ->
-              Logger.error("Failed to update ref: status=#{status}, body=#{inspect(body)}, path=#{patch_path}")
-              {:error, :force_push, status, body}
+                  %{status: status, body: body} ->
+                    Logger.error("Failed to delete ref: status=#{status}, body=#{inspect(body)}")
+                    {:error, :force_push, status, body}
+                end
+
+              %{status: status, body: body} ->
+                Logger.error("Failed to update ref: status=#{status}, body=#{inspect(body)}, path=#{patch_path}")
+                {:error, :force_push, status, body}
+            end
+          else
+            # Fallback to old method if repo_full_name not available
+            Logger.error("Could not get repo full_name, using fallback method")
+            msg = %{force: true, sha: sha}
+            patch_path = "git/refs/heads/#{to}"
+
+            repo_conn
+            |> patch!(patch_path, Jason.encode!(msg))
+            |> case do
+              %{status: 200} ->
+                {:ok, sha}
+
+              %{status: status, body: body} ->
+                {:error, :force_push, status, body}
+            end
           end
+
+          result
         else
           Logger.info("SHA already matches, no update needed")
           {:ok, sha}
@@ -1001,6 +1057,21 @@ defmodule BorsNG.GitHub.Server do
 
   def raw_token!({:raw, _} = raw, state) do
     {raw, state}
+  end
+
+  # Get repository full_name (owner/repo) from repository ID
+  defp get_repo_full_name(token, repo_xref) do
+    "token #{token}"
+    |> tesla_client()
+    |> Tesla.get!("/repositories/#{repo_xref}")
+    |> case do
+      %{body: raw, status: 200} ->
+        full_name = Jason.decode!(raw)["full_name"]
+        {:ok, full_name}
+
+      _ ->
+        {:error, :not_found}
+    end
   end
 
   defp tesla_client(authorization, content_type \\ @content_type) do
