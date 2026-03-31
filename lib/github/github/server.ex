@@ -371,6 +371,7 @@ defmodule BorsNG.GitHub.Server do
         Logger.info("Branch #{to} exists, current_sha=#{current_sha}, new_sha=#{sha}")
 
         if sha != current_sha do
+          # Try PATCH first
           msg = %{force: true, sha: sha}
           patch_path = "git/refs/heads/#{to}"
           Logger.info("Updating ref with PATCH to: #{patch_path}")
@@ -381,6 +382,32 @@ defmodule BorsNG.GitHub.Server do
             %{status: 200} ->
               Logger.info("Successfully updated ref")
               {:ok, sha}
+
+            %{status: 422, body: body} ->
+              Logger.warn("PATCH failed with 422, trying DELETE+POST instead. Error: #{inspect(body)}")
+
+              # Delete the ref
+              case delete!(repo_conn, "git/refs/heads/#{to}") do
+                %{status: 204} ->
+                  Logger.info("Successfully deleted ref")
+                  # Recreate it
+                  msg = %{ref: "refs/heads/#{to}", sha: sha}
+                  repo_conn
+                  |> post!("git/refs", Jason.encode!(msg))
+                  |> case do
+                    %{status: 201} ->
+                      Logger.info("Successfully recreated ref")
+                      {:ok, sha}
+
+                    %{status: status, body: body} ->
+                      Logger.error("Failed to recreate ref: status=#{status}, body=#{inspect(body)}")
+                      {:error, :force_push, status, body}
+                  end
+
+                %{status: status, body: body} ->
+                  Logger.error("Failed to delete ref: status=#{status}, body=#{inspect(body)}")
+                  {:error, :force_push, status, body}
+              end
 
             %{status: status, body: body} ->
               Logger.error("Failed to update ref: status=#{status}, body=#{inspect(body)}, path=#{patch_path}")
@@ -835,13 +862,13 @@ defmodule BorsNG.GitHub.Server do
          content_type \\ @content_type
        ) do
     url = "/repositories/#{repo_xref}/#{path}"
-    Logger.debug("PATCH request: #{url}, body: #{body}")
+    Logger.info("PATCH request: #{url}, body: #{body}")
 
     result = "token #{token}"
     |> tesla_client(content_type)
     |> Tesla.patch!(url, body)
 
-    Logger.debug("PATCH response: status=#{result.status}, body=#{inspect(result.body)}")
+    Logger.info("PATCH response: status=#{result.status}, body=#{inspect(result.body)}")
     result
   end
 
