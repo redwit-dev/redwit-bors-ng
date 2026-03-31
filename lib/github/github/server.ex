@@ -966,6 +966,7 @@ defmodule BorsNG.GitHub.Server do
          {"accept", content_type},
          {"user-agent", "bors-ng https://bors.tech"}
        ]},
+      Tesla.Middleware.FollowRedirects,
       {Tesla.Middleware.Retry, delay: 100, max_retries: 5}
     ]
 

@@ -21,6 +21,8 @@ erl_crash.dump
 # this depending on your deployment strategy.
 /priv/static/
 
+/worklogs
+
 /.idea
 /*.iml
 /projectFilesBackup
