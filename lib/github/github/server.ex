@@ -351,22 +351,42 @@ defmodule BorsNG.GitHub.Server do
     # Get repository information to obtain owner/repo name
     {{:raw, token}, repo_xref} = repo_conn
     repo_full_name = case get_repo_full_name(token, repo_xref) do
-      {:ok, name} -> name
-      {:error, _} -> nil
+      {:ok, name} ->
+        Logger.info("Successfully retrieved repo full_name: #{name}")
+        name
+      {:error, reason} ->
+        Logger.error("Failed to get repo full_name: #{inspect(reason)}")
+        nil
     end
 
-    Logger.info("Repository: #{inspect(repo_full_name)}")
+    Logger.info("Repository full_name: #{inspect(repo_full_name)}, repo_xref: #{repo_xref}")
 
-    repo_conn
-    |> get!("branches/#{to}")
-    |> case do
+    # Check if ref exists using git/refs API (more reliable than branches API)
+    ref_exists_response = if repo_full_name do
+      ref = "heads/#{to}"
+      get_ref_path = "/repos/#{repo_full_name}/git/refs/#{ref}"
+      Logger.info("Checking ref with GET #{get_ref_path}")
+
+      "token #{token}"
+      |> tesla_client()
+      |> Tesla.get(get_ref_path)
+      |> case do
+        {:ok, response} -> response
+        {:error, _} -> %{status: 404}  # Treat error as not found
+      end
+    else
+      # Fallback to branches API
+      repo_conn |> get!("branches/#{to}")
+    end
+
+    case ref_exists_response do
       %{status: 404} ->
         Logger.info("Branch #{to} not found, creating new ref")
         msg = %{ref: "refs/heads/#{to}", sha: sha}
 
         result = if repo_full_name do
           post_path = "/repos/#{repo_full_name}/git/refs"
-          Logger.info("Creating ref with POST to: #{post_path}")
+          Logger.info("Creating ref with POST to: #{post_path}, ref: refs/heads/#{to}")
 
           "token #{token}"
           |> tesla_client()
@@ -396,14 +416,30 @@ defmodule BorsNG.GitHub.Server do
         result
 
       %{body: raw, status: 200} ->
-        current_sha = Jason.decode!(raw)["commit"]["sha"]
-        Logger.info("Branch #{to} exists, current_sha=#{current_sha}, new_sha=#{sha}")
+        # Parse SHA from response (handle both git/refs and branches API formats)
+        parsed = Jason.decode!(raw)
+        current_sha = cond do
+          Map.has_key?(parsed, "object") and Map.has_key?(parsed["object"], "sha") ->
+            # git/refs API format: {"ref": "...", "object": {"sha": "...", ...}}
+            parsed["object"]["sha"]
+          Map.has_key?(parsed, "commit") and Map.has_key?(parsed["commit"], "sha") ->
+            # branches API format: {"commit": {"sha": "...", ...}}
+            parsed["commit"]["sha"]
+          true ->
+            Logger.error("Unable to parse SHA from response: #{inspect(parsed)}")
+            nil
+        end
+
+        Logger.info("Ref #{to} exists, current_sha=#{current_sha}, new_sha=#{sha}")
 
         if sha != current_sha do
           # Use owner/repo format for git refs operations
           result = if repo_full_name do
             msg = %{force: true, sha: sha}
-            patch_path = "/repos/#{repo_full_name}/git/refs/heads/#{to}"
+            # GitHub API: PATCH /repos/{owner}/{repo}/git/refs/{ref}
+            # where {ref} is "heads/branch-name"
+            ref = "heads/#{to}"
+            patch_path = "/repos/#{repo_full_name}/git/refs/#{ref}"
             Logger.info("Updating ref with PATCH to: #{patch_path}")
 
             "token #{token}"
@@ -418,7 +454,8 @@ defmodule BorsNG.GitHub.Server do
                 Logger.warn("PATCH failed with 422, trying DELETE+POST instead. Error: #{inspect(body)}")
 
                 # Delete the ref
-                delete_path = "/repos/#{repo_full_name}/git/refs/heads/#{to}"
+                delete_path = "/repos/#{repo_full_name}/git/refs/#{ref}"
+                Logger.info("Deleting ref with DELETE to: #{delete_path}")
                 "token #{token}"
                 |> tesla_client()
                 |> Tesla.delete!(delete_path)
